@@ -56,7 +56,12 @@ self_test( void ) {
       if( FD_UNLIKELY( rd<=0L ) ) break;
       buf[ rd ] = '\0';
       long nr = strtol( buf, NULL, 10 );
+#ifdef __NR_epoll_wait
       if( FD_LIKELY( nr==__NR_epoll_pwait || nr==__NR_epoll_wait ) ) { blocked = 1; break; }
+#else
+      /* aarch64 has no legacy epoll_wait syscall; only epoll_pwait. */
+      if( FD_LIKELY( nr==__NR_epoll_pwait ) ) { blocked = 1; break; }
+#endif
       sched_yield();
     }
     long n = write( pfd[ 1 ], "x", 1UL );
