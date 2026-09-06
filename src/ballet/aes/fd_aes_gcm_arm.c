@@ -1,9 +1,7 @@
 #include "fd_aes_gcm.h"
 
 /* fd_aes_gcm_arm.c: AES-GCM backend using the ARMv8 Crypto Extensions
-   (FEAT_AES) for the AES block cipher.  GHASH is currently delegated to
-   the portable 4-bit table implementation (fd_gcm_ghash_4bit); a PMULL
-   (FEAT_PMULL) GHASH is a straightforward follow-up.
+   (FEAT_AES) for the AES block cipher and FEAT_PMULL for GHASH.
 
    The ARM AESE/AESMC instructions use the natural (FIPS-197) byte order
    and the semantics
@@ -16,7 +14,15 @@
 
    The round keys are produced here in natural byte order (byte 0 = MSB
    of each FIPS-197 word).  Do not reuse fd_aes_set_encrypt_key, which
-   stores u32 round keys in the host (little-endian) byte order. */
+   stores u32 round keys in the host (little-endian) byte order.
+
+   GHASH uses PMULL (carry-less multiply) in the natural bit order
+   (bit i = coefficient x^i), with the reduction polynomial
+   x^128 + x^7 + x^2 + x + 1 (fold: x^128 = x^7+x^2+x+1).  The GCM spec
+   stores coefficients in descending order (b_0 = x^127), so each block is
+   bit-reversed within each byte (RBIT) to reach natural order before the
+   multiply, and bit-reversed back after.  This produces byte-identical
+   results to the portable 4-bit table GHASH (fd_gcm_ghash_4bit). */
 
 #if FD_HAS_ARM
 
@@ -109,6 +115,95 @@ fd_aes_arm_encrypt_block( uchar const       in [ 16 ],
   vst1q_u8( out, s );
 }
 
+/* --- GHASH via PMULL ---------------------------------------------------- */
+
+/* fd_ulong_rbit: full 64-bit bit reversal (RBIT instruction). */
+static inline ulong
+fd_ulong_rbit( ulong x ) {
+  ulong r;
+  __asm__ volatile( "rbit %0, %1" : "=r"(r) : "r"(x) );
+  return r;
+}
+
+/* fd_ulong_bitrev8: reverse the bits within each byte of a 64-bit word.
+   RBIT gives full 64-bit reversal; a byte swap on top leaves only the
+   per-byte bit reversal (RBIT and byte-swap commute). */
+static inline ulong
+fd_ulong_bitrev8( ulong x ) {
+  return fd_ulong_bswap( fd_ulong_rbit( x ) );
+}
+
+/* fd_gcm_pmull_mul: GF(2^128) multiply in natural bit order (bit i = x^i),
+   reduction polynomial x^128 + x^7 + x^2 + x + 1.  Operands are (lo,hi)
+   64-bit halves; result returned in (*r_lo,*r_hi).  Computed as a 4-PMULL
+   schoolbook carry-less product followed by the fold reduction
+       Z = P_lo ^ P_hi ^ (P_hi << 1) ^ (P_hi << 2) ^ (P_hi << 7)
+   iterated until the result fits in 128 bits (converges in 2 iterations). */
+__attribute__((target("+crypto")))
+static inline void
+fd_gcm_pmull_mul( ulong  a_lo, ulong  a_hi,
+                  ulong  b_lo, ulong  b_hi,
+                  ulong * r_lo, ulong * r_hi ) {
+  uint128 p00 = (uint128)vmull_p64( (poly64_t)a_lo, (poly64_t)b_lo );
+  uint128 p01 = (uint128)vmull_p64( (poly64_t)a_lo, (poly64_t)b_hi );
+  uint128 p10 = (uint128)vmull_p64( (poly64_t)a_hi, (poly64_t)b_lo );
+  uint128 p11 = (uint128)vmull_p64( (poly64_t)a_hi, (poly64_t)b_hi );
+
+  ulong w0 = (ulong)p00;
+  ulong w1 = (ulong)( p00 >> 64 ) ^ (ulong)p01 ^ (ulong)p10;
+  ulong w2 = (ulong)( p01 >> 64 ) ^ (ulong)( p10 >> 64 ) ^ (ulong)p11;
+  ulong w3 = (ulong)( p11 >> 64 );
+
+  ulong z0 = w0, z1 = w1, z2 = w2, z3 = w3;
+  while( z2 | z3 ) {
+    ulong h0 = z2, h1 = z3;   /* high 128 bits = [h1:h0] */
+    z0 ^= h0 ^ ( h0 << 1 ) ^ ( h0 << 2 ) ^ ( h0 << 7 );
+    z1 ^= h1 ^ ( ( h1 << 1 ) | ( h0 >> 63 ) )
+             ^ ( ( h1 << 2 ) | ( h0 >> 62 ) )
+             ^ ( ( h1 << 7 ) | ( h0 >> 57 ) );
+    z2 = ( h1 >> 63 ) ^ ( h1 >> 62 ) ^ ( h1 >> 57 );
+    z3 = 0;
+  }
+  *r_lo = z0;
+  *r_hi = z1;
+}
+
+/* fd_gcm_gmult_pmull: Xi = Xi * H in GF(2^128).  Xi is a 16-byte block in
+   GCM byte order (ulong[2], little-endian halves); H_nat is the hash key in
+   natural order ([0]=lo, [1]=hi). */
+static void
+fd_gcm_gmult_pmull( ulong       Xi[ 2 ],
+                    ulong const H_nat[ 2 ] ) {
+  ulong a_lo = fd_ulong_bitrev8( Xi[ 0 ] );
+  ulong a_hi = fd_ulong_bitrev8( Xi[ 1 ] );
+  ulong r_lo, r_hi;
+  fd_gcm_pmull_mul( a_lo, a_hi, H_nat[ 0 ], H_nat[ 1 ], &r_lo, &r_hi );
+  Xi[ 0 ] = fd_ulong_bitrev8( r_lo );
+  Xi[ 1 ] = fd_ulong_bitrev8( r_hi );
+}
+
+/* fd_gcm_ghash_pmull: GHASH over len bytes (multiple of 16): for each block,
+   Xi = (Xi ^ block) * H.  Xi and H_nat as in fd_gcm_gmult_pmull. */
+static void
+fd_gcm_ghash_pmull( ulong             Xi[ 2 ],
+                    ulong const       H_nat[ 2 ],
+                    uchar const *     inp,
+                    ulong             len ) {
+  ulong a_lo = fd_ulong_bitrev8( Xi[ 0 ] );
+  ulong a_hi = fd_ulong_bitrev8( Xi[ 1 ] );
+  while( len > 0 ) {
+    ulong b0 = fd_ulong_load_8( inp     );
+    ulong b1 = fd_ulong_load_8( inp + 8 );
+    a_lo ^= fd_ulong_bitrev8( b0 );
+    a_hi ^= fd_ulong_bitrev8( b1 );
+    fd_gcm_pmull_mul( a_lo, a_hi, H_nat[ 0 ], H_nat[ 1 ], &a_lo, &a_hi );
+    inp += 16;
+    len -= 16;
+  }
+  Xi[ 0 ] = fd_ulong_bitrev8( a_lo );
+  Xi[ 1 ] = fd_ulong_bitrev8( a_hi );
+}
+
 /* ARM GCM state: same GCM fields as the portable reference, but with the
    ARM round keys instead of fd_aes_key_ref_t.  (State layout defined in
    fd_aes_gcm.h.) */
@@ -148,12 +243,12 @@ fd_aes_gcm_init_arm( fd_aes_gcm_arm_t * gcm,
   fd_aes_arm_set_encrypt_key( key, key_sz, gcm->rk, &gcm->nr );
 
   fd_aes_arm_encrypt_block( (uchar const *)gcm->H.c, gcm->H.c, gcm->rk, gcm->nr );
-  /* gcm->H.c was zeroed by memset; encrypt the all-zero block to get H */
+  /* gcm->H.c was zeroed by memset; encrypt the all-zero block to get H in
+     GCM (NIST) byte order. */
 
-  gcm->H.u[ 0 ] = fd_ulong_bswap( gcm->H.u[ 0 ] );
-  gcm->H.u[ 1 ] = fd_ulong_bswap( gcm->H.u[ 1 ] );
+  gcm->H_nat[ 0 ] = fd_ulong_bitrev8( gcm->H.u[ 0 ] );
+  gcm->H_nat[ 1 ] = fd_ulong_bitrev8( gcm->H.u[ 1 ] );
 
-  fd_gcm_init_4bit( gcm->Htable, gcm->H.u );
   fd_aes_gcm_arm_setiv( gcm, iv );
 }
 
@@ -176,12 +271,12 @@ fd_gcm128_arm_aad( fd_aes_gcm_arm_t * gcm,
       --aad_sz;
       n = (n + 1) % 16;
     }
-    if( n == 0 ) fd_gcm_gmult_4bit( gcm->Xi.u, gcm->Htable );
+    if( n == 0 ) fd_gcm_gmult_pmull( gcm->Xi.u, gcm->H_nat );
     else { gcm->ares = n; return 0; }
   }
   ulong i;
   if( ( i = ( aad_sz & (ulong)-16 ) ) ) {
-    fd_gcm_ghash_4bit( gcm->Xi.u, gcm->Htable, aad, i );
+    fd_gcm_ghash_pmull( gcm->Xi.u, gcm->H_nat, aad, i );
     aad += i;
     aad_sz -= i;
   }
@@ -210,7 +305,7 @@ fd_gcm128_arm_crypt( fd_aes_gcm_arm_t * gcm,
   mres = gcm->mres;
 
   if( gcm->ares ) {
-    if( len == 0 ) { fd_gcm_gmult_4bit( gcm->Xi.u, gcm->Htable ); gcm->ares = 0; return 0; }
+    if( len == 0 ) { fd_gcm_gmult_pmull( gcm->Xi.u, gcm->H_nat ); gcm->ares = 0; return 0; }
     memcpy( gcm->Xn, gcm->Xi.c, sizeof(gcm->Xi) );
     gcm->Xi.u[0] = 0;
     gcm->Xi.u[1] = 0;
@@ -238,7 +333,7 @@ fd_gcm128_arm_crypt( fd_aes_gcm_arm_t * gcm,
     }
     n = (n + 1) % 16;
     if( mres == sizeof(gcm->Xn) ) {
-      fd_gcm_ghash_4bit( gcm->Xi.u, gcm->Htable, gcm->Xn, sizeof(gcm->Xn) );
+      fd_gcm_ghash_pmull( gcm->Xi.u, gcm->H_nat, gcm->Xn, sizeof(gcm->Xn) );
       mres = 0;
     }
   }
@@ -259,11 +354,11 @@ fd_gcm128_arm_finish( fd_aes_gcm_arm_t * gcm ) {
     memset( gcm->Xn + mres, 0, blocks - mres );
     mres = blocks;
     if( mres == sizeof(gcm->Xn) ) {
-      fd_gcm_ghash_4bit( gcm->Xi.u, gcm->Htable, gcm->Xn, mres );
+      fd_gcm_ghash_pmull( gcm->Xi.u, gcm->H_nat, gcm->Xn, mres );
       mres = 0;
     }
   } else if( gcm->ares ) {
-    fd_gcm_gmult_4bit( gcm->Xi.u, gcm->Htable );
+    fd_gcm_gmult_pmull( gcm->Xi.u, gcm->H_nat );
   }
 
   alen = fd_ulong_bswap( alen );
@@ -272,7 +367,7 @@ fd_gcm128_arm_finish( fd_aes_gcm_arm_t * gcm ) {
   bitlen.lo = clen;
   memcpy( gcm->Xn + mres, &bitlen, sizeof(bitlen) );
   mres += (uint)sizeof(bitlen);
-  fd_gcm_ghash_4bit( gcm->Xi.u, gcm->Htable, gcm->Xn, mres );
+  fd_gcm_ghash_pmull( gcm->Xi.u, gcm->H_nat, gcm->Xn, mres );
 
   gcm->Xi.u[0] ^= gcm->EK0.u[0];
   gcm->Xi.u[1] ^= gcm->EK0.u[1];

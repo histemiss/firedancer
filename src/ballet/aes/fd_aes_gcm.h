@@ -75,7 +75,7 @@ struct __attribute__((aligned(FD_AES_GCM_ALIGN))) fd_aes_gcm_arm_state {
     uchar c[16];
     ulong t[ 2];
   } Yi, EKi, EK0, len, Xi, H;
-  fd_gcm128_t Htable[16];
+  ulong   H_nat[2];  /* PMULL hash key in natural (bit-reversed-per-byte) order */
   uint    mres, ares;
   uchar   Xn[48];
   uchar   rk[ 15 ][ 16 ];
