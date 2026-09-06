@@ -95,12 +95,19 @@ FD_FN_PURE static inline ulong fd_fseq_seq0( ulong const * fseq ) { return fseq[
 /* fd_fseq_query reads the current sequence number stored the fseq.  The
    value is observed at some point between when the call started and the
    call returned.  This acts as an implicit compiler fence.  Assumes
-   fseq is a current local join. */
+   fseq is a current local join.
+
+   The load uses acquire semantics: on weakly-ordered targets (ARM,
+   POWER, ...) the fseq sequence number is a publish flag for the app
+   data region (fd_fseq_app_laddr), so a consumer that observes seq must
+   also observe all app-data writes the producer made before publishing
+   that seq.  On x86 this ordering is implied by TSO, but it must be
+   explicit elsewhere. */
 
 static inline ulong
 fd_fseq_query( ulong const * fseq ) {
   FD_COMPILER_MFENCE();
-  ulong seq = FD_VOLATILE_CONST( fseq[0] );
+  ulong seq = __atomic_load_n( fseq, __ATOMIC_ACQUIRE );
   FD_COMPILER_MFENCE();
   return seq;
 }
@@ -108,13 +115,17 @@ fd_fseq_query( ulong const * fseq ) {
 /* fd_fseq_update updates the sequence number stored in the fseq to seq.
    The value is updated at some point between when the call started and
    the call returned.  This acts as an implicit compiler fence.  Assumes
-   fseq is a current local join. */
+   fseq is a current local join.
+
+   The store uses release semantics so that all app-data writes made
+   before the seq publish become visible to any consumer that observes
+   the new seq (see fd_fseq_query above). */
 
 static inline void
 fd_fseq_update( ulong * fseq,
                 ulong   seq ) {
   FD_COMPILER_MFENCE();
-  FD_VOLATILE( fseq[0] ) = seq;
+  __atomic_store_n( fseq, seq, __ATOMIC_RELEASE );
   FD_COMPILER_MFENCE();
 }
 

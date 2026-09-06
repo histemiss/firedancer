@@ -248,6 +248,9 @@ fd_sha512_core_avx2( ulong *       state,       /* 64-byte aligned, 8 entries */
 
 #elif FD_SHA512_CORE_IMPL==2
 
+/* Explicit target attribute: same -mtune=native FEAT_SHA3/SHA512 dropping
+   issue as fd_sha256_core_arm.  See that function's comment for details. */
+__attribute__((target("+sha3")))
 static void
 fd_sha512_core_arm( ulong *       state,
                     uchar const * block,

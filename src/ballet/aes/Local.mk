@@ -11,5 +11,8 @@ $(call add-asms,fd_aes_gcm_avx10,fd_ballet)
 endif
 endif
 endif
+ifdef FD_HAS_ARM_AES
+$(call add-objs,fd_aes_gcm_arm,fd_ballet)
+endif
 $(call make-unit-test,test_aes,test_aes,fd_ballet fd_util)
 $(call run-unit-test,test_aes)

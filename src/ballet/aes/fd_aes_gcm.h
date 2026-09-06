@@ -66,6 +66,47 @@ struct __attribute__((aligned(FD_AES_GCM_ALIGN))) fd_aes_gcm_avx10_state {
 };
 typedef struct fd_aes_gcm_avx10_state fd_aes_gcm_avx10_t;
 
+/* ARMv8 Crypto Extensions (FEAT_AES) backend internals **************/
+
+struct __attribute__((aligned(FD_AES_GCM_ALIGN))) fd_aes_gcm_arm_state {
+  union {
+    ulong u[ 2];
+    uint  d[ 4];
+    uchar c[16];
+    ulong t[ 2];
+  } Yi, EKi, EK0, len, Xi, H;
+  fd_gcm128_t Htable[16];
+  uint    mres, ares;
+  uchar   Xn[48];
+  uchar   rk[ 15 ][ 16 ];
+  uint    nr;
+};
+typedef struct fd_aes_gcm_arm_state fd_aes_gcm_arm_t;
+
+void
+fd_aes_gcm_init_arm( fd_aes_gcm_arm_t * aes_gcm,
+                     uchar const *      key,
+                     ulong              key_sz,
+                     uchar const        iv[ 12 ] );
+
+void
+fd_aes_gcm_encrypt_arm( fd_aes_gcm_arm_t * aes_gcm,
+                        uchar *            c,
+                        uchar const *      p,
+                        ulong              sz,
+                        uchar const *      aad,
+                        ulong              aad_sz,
+                        uchar              tag[ 16 ] );
+
+int
+fd_aes_gcm_decrypt_arm( fd_aes_gcm_arm_t * aes_gcm,
+                        uchar const *      c,
+                        uchar *            p,
+                        ulong              sz,
+                        uchar const *      aad,
+                        ulong              aad_sz,
+                        uchar const        tag[ 16 ] );
+
 /* Backend selection **************************************************/
 
 #if FD_HAS_AVX512 && FD_HAS_GFNI && FD_HAS_AESNI
@@ -74,6 +115,8 @@ typedef struct fd_aes_gcm_avx10_state fd_aes_gcm_avx10_t;
 #define FD_AES_GCM_IMPL 2 /* AVX2, VAES */
 #elif FD_HAS_AESNI
 #define FD_AES_GCM_IMPL 1 /* AESNI */
+#elif FD_HAS_ARM_AES
+#define FD_AES_GCM_IMPL 4 /* ARMv8 FEAT_AES Crypto Extensions */
 #else
 #define FD_AES_GCM_IMPL 0 /* Portable */
 #endif
@@ -105,6 +148,13 @@ typedef struct fd_aes_gcm_avx10_state fd_aes_gcm_avx10_t;
   #define fd_aes_gcm_init     fd_aes_gcm_init_avx10_512
   #define fd_aes_gcm_encrypt  fd_aes_gcm_encrypt_avx10_512
   #define fd_aes_gcm_decrypt  fd_aes_gcm_decrypt_avx10_512
+
+#elif FD_AES_GCM_IMPL == 4
+
+  typedef fd_aes_gcm_arm_t   fd_aes_gcm_t;
+  #define fd_aes_gcm_init     fd_aes_gcm_init_arm
+  #define fd_aes_gcm_encrypt  fd_aes_gcm_encrypt_arm
+  #define fd_aes_gcm_decrypt  fd_aes_gcm_decrypt_arm
 
 #endif
 
