@@ -1,0 +1,36 @@
+# Minimal ARM (aarch64) benchmark configuration.
+#
+# The full firedancer validator has x86 TSO assumptions that have not yet
+# been ported to ARM, so this config keeps the tile set small and uses the
+# socket net provider (no XDP / root networking) to get the bench topology
+# running on an aarch64 host.  Tune tile counts up once TSO correctness is
+# confirmed on ARM.
+[layout]
+  affinity = "auto"
+  net_tile_count = 1
+  quic_tile_count = 1
+  resolv_tile_count = 1
+  verify_tile_count = 4
+  gossvf_tile_count = 1
+  execle_tile_count = 1
+  execrp_tile_count = 1
+  shred_tile_count = 1
+  sign_tile_count = 2
+
+[net]
+  provider = "socket"
+
+[development.genesis]
+  fund_initial_accounts = 1024
+
+[development.bench]
+  benchg_tile_count = 4
+  benchs_tile_count = 1
+  larger_max_cost_per_block = true
+  larger_shred_limits_per_block = true
+
+[tiles.shred]
+  max_pending_shred_sets = 4096
+
+[tiles.pack]
+  schedule_strategy = "perf"
