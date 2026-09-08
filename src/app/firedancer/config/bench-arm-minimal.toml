@@ -45,5 +45,8 @@
 [tiles.gui]
   enabled = false
 
+[tiles.event]
+  url = ""
+
 [tiles.pack]
   schedule_strategy = "perf"
