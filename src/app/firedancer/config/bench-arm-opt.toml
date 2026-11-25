@@ -1,0 +1,53 @@
+# Optimized ARM benchmark for this machine (256 cores, 2 NUMA nodes: 0-127, 128-255).
+# Changes vs bench-arm-max.toml:
+#  - blocklist_cores reduced from "0-79" (which assumed a 4-node box) to "0-7"
+#    (reserve 8 cores for OS/irq), freeing ~72 more cores for tiles.
+#  - verify_tile_count 32 -> 64 (ed25519 verify is the dominant ingest cost).
+#  - execle/execrp 2 -> 4 (more execution parallelism behind verify).
+#  - benchg 16 -> 32 (saturate the verify/exec pipeline with load).
+#  - benchs 2 -> 4 (match the larger generator fan-out).
+
+[hugetlbfs]
+  max_page_size = "huge"
+
+[accounts]
+  max_accounts = 131072
+
+[runtime]
+  max_live_slots = 512
+  max_fork_width = 16
+
+[layout]
+  affinity = "auto"
+  blocklist_cores = "0-7"
+  net_tile_count = 1
+  quic_tile_count = 1
+  resolv_tile_count = 1
+  verify_tile_count = 64
+  gossvf_tile_count = 1
+  execle_tile_count = 4
+  execrp_tile_count = 4
+  shred_tile_count = 1
+  sign_tile_count = 2
+
+[net]
+  provider = "socket"
+
+[development.genesis]
+  fund_initial_accounts = 1024
+
+[development.bench]
+  benchg_tile_count = 32
+  benchs_tile_count = 4
+
+[tiles.shred]
+  max_pending_shred_sets = 512
+
+[tiles.gui]
+  enabled = false
+
+[tiles.event]
+  url = ""
+
+[tiles.pack]
+  schedule_strategy = "perf"

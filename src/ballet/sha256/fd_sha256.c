@@ -367,7 +367,7 @@ fd_sha256_core_shaext( uint *        state,       /* 64-byte aligned, 8 entries 
    HiSilicon Kunpeng-class parts), which makes the vsha256* intrinsics in
    arm_neon.h fail with "target specific option mismatch".  The feature is
    genuinely present on the hardware, so re-enable it for this function. */
-__attribute__((target("+sha2")))
+__attribute__((target("+crypto")))
 static void
 fd_sha256_core_arm( uint *        state,
                     uchar const * block,
@@ -635,7 +635,7 @@ fd_sha256_hash( void const * _data,
 
 /* Explicit target attribute: same -mtune=native FEAT_SHA2 dropping issue as
    fd_sha256_core_arm.  See that function's comment for details. */
-__attribute__((target("+sha2")))
+__attribute__((target("+crypto")))
 void *
 fd_sha256_hash_32_repeated( void const * _data,
                             void *       _hash,

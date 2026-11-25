@@ -120,6 +120,14 @@ fd_blake3_sve2_compress4_fast( uchar const * restrict batch_data,
                                ulong                  counter,
                                uchar                  flags );
 
+void
+fd_blake3_sve2_xof_2048( uchar       * restrict hash,
+                         uchar const * restrict root_msg,
+                         uchar const * restrict root_cv,
+                         uint                   block_sz,
+                         ulong                  ctr0,
+                         uint                   flags );
+
 #endif /* FD_HAS_SVE2 */
 
 #if FD_HAS_AVX

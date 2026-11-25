@@ -224,6 +224,131 @@ fd_blake3_sve2_compress4_fast( uchar const * restrict batch_data,
   fd_blake3_sve2_compress4( 4UL, data, sz, ctr, flag, hash, 32U, NULL );
 }
 
+/* fd_blake3_sve2_xof_2048 expands a single root block into 2048 bytes of
+   XOF (LtHash) output.  All 32 output blocks share the same message and
+   chaining value; only the 64-bit counter changes (consecutively, 4 at a
+   time).  The generic compress4 path re-transposes the message/CV matrices
+   on every call; this specialized loop loads them ONCE, broadcasts the
+   message words (all 4 lanes identical) with svdup instead of re-loading,
+   and only updates the counter per group.  Semantically identical to the
+   fini_2048 SVE2 loop. */
+
+#define MX( idx ) svdup_n_u32( msg_word[ FD_BLAKE3_MSG_SCHEDULE[ round ][ (idx) ] ] )
+
+#define ROUNDX() do {                     \
+    G( v0, v4, v8,  v12, MX( 0), MX( 1) ); \
+    G( v1, v5, v9,  v13, MX( 2), MX( 3) ); \
+    G( v2, v6, v10, v14, MX( 4), MX( 5) ); \
+    G( v3, v7, v11, v15, MX( 6), MX( 7) ); \
+    G( v0, v5, v10, v15, MX( 8), MX( 9) ); \
+    G( v1, v6, v11, v12, MX(10), MX(11) ); \
+    G( v2, v7, v8,  v13, MX(12), MX(13) ); \
+    G( v3, v4, v9,  v14, MX(14), MX(15) ); \
+  } while(0)
+
+void
+fd_blake3_sve2_xof_2048( uchar       * restrict hash,     /* 2048 bytes out */
+                         uchar const * restrict root_msg, /* 64 bytes */
+                         uchar const * restrict root_cv,  /* 32 bytes */
+                         uint                   block_sz,
+                         ulong                  ctr0,
+                         uint                   flags ) {
+  svbool_t const pg4 = svwhilelt_b32_u64( 0UL, 4UL );
+
+  /* message words (all 4 lanes identical for XOF) kept as scalars */
+  uint msg_word[16];
+  for( ulong w=0UL; w<16UL; w++ ) msg_word[w] = FD_LOAD( uint, root_msg + 4UL*w );
+
+  /* chaining value broadcast once */
+  svuint32_t const h0 = svdup_n_u32( FD_LOAD( uint, root_cv +  0UL ) );
+  svuint32_t const h1 = svdup_n_u32( FD_LOAD( uint, root_cv +  4UL ) );
+  svuint32_t const h2 = svdup_n_u32( FD_LOAD( uint, root_cv +  8UL ) );
+  svuint32_t const h3 = svdup_n_u32( FD_LOAD( uint, root_cv + 12UL ) );
+  svuint32_t const h4 = svdup_n_u32( FD_LOAD( uint, root_cv + 16UL ) );
+  svuint32_t const h5 = svdup_n_u32( FD_LOAD( uint, root_cv + 20UL ) );
+  svuint32_t const h6 = svdup_n_u32( FD_LOAD( uint, root_cv + 24UL ) );
+  svuint32_t const h7 = svdup_n_u32( FD_LOAD( uint, root_cv + 28UL ) );
+
+  svuint32_t const iv0 = svdup_n_u32( FD_BLAKE3_IV[0] );
+  svuint32_t const iv1 = svdup_n_u32( FD_BLAKE3_IV[1] );
+  svuint32_t const iv2 = svdup_n_u32( FD_BLAKE3_IV[2] );
+  svuint32_t const iv3 = svdup_n_u32( FD_BLAKE3_IV[3] );
+  svuint32_t const blen = svdup_n_u32( block_sz );
+  svuint32_t const bflg = svdup_n_u32( flags );
+
+  for( ulong i=0UL; i<32UL; i+=4UL ) {
+    uint ctr_lo[4] __attribute__((aligned(16)));
+    uint ctr_hi[4] __attribute__((aligned(16)));
+    for( ulong l=0UL; l<4UL; l++ ) {
+      ulong c   = ctr0 + i + l;
+      ctr_lo[l] = (uint)c;
+      ctr_hi[l] = (uint)( c >> 32 );
+    }
+
+    svuint32_t v0  = h0;
+    svuint32_t v1  = h1;
+    svuint32_t v2  = h2;
+    svuint32_t v3  = h3;
+    svuint32_t v4  = h4;
+    svuint32_t v5  = h5;
+    svuint32_t v6  = h6;
+    svuint32_t v7  = h7;
+    svuint32_t v8  = iv0;
+    svuint32_t v9  = iv1;
+    svuint32_t v10 = iv2;
+    svuint32_t v11 = iv3;
+    svuint32_t v12 = svld1_u32( pg4, ctr_lo );
+    svuint32_t v13 = svld1_u32( pg4, ctr_hi );
+    svuint32_t v14 = blen;
+    svuint32_t v15 = bflg;
+
+    for( ulong round=0UL; round<7UL; round++ ) ROUNDX();
+
+    svuint32_t const d0 = sveor_u32_x( pg4, v0,  v8  );
+    svuint32_t const d1 = sveor_u32_x( pg4, v1,  v9  );
+    svuint32_t const d2 = sveor_u32_x( pg4, v2,  v10 );
+    svuint32_t const d3 = sveor_u32_x( pg4, v3,  v11 );
+    svuint32_t const d4 = sveor_u32_x( pg4, v4,  v12 );
+    svuint32_t const d5 = sveor_u32_x( pg4, v5,  v13 );
+    svuint32_t const d6 = sveor_u32_x( pg4, v6,  v14 );
+    svuint32_t const d7 = sveor_u32_x( pg4, v7,  v15 );
+
+    svuint32_t const u0 = sveor_u32_x( pg4, h0,  v8  );
+    svuint32_t const u1 = sveor_u32_x( pg4, h1,  v9  );
+    svuint32_t const u2 = sveor_u32_x( pg4, h2,  v10 );
+    svuint32_t const u3 = sveor_u32_x( pg4, h3,  v11 );
+    svuint32_t const u4 = sveor_u32_x( pg4, h4,  v12 );
+    svuint32_t const u5 = sveor_u32_x( pg4, h5,  v13 );
+    svuint32_t const u6 = sveor_u32_x( pg4, h6,  v14 );
+    svuint32_t const u7 = sveor_u32_x( pg4, h7,  v15 );
+
+    uint result[16][4] __attribute__((aligned(64)));
+    svst1_u32( pg4, result[ 0], d0 );
+    svst1_u32( pg4, result[ 1], d1 );
+    svst1_u32( pg4, result[ 2], d2 );
+    svst1_u32( pg4, result[ 3], d3 );
+    svst1_u32( pg4, result[ 4], d4 );
+    svst1_u32( pg4, result[ 5], d5 );
+    svst1_u32( pg4, result[ 6], d6 );
+    svst1_u32( pg4, result[ 7], d7 );
+    svst1_u32( pg4, result[ 8], u0 );
+    svst1_u32( pg4, result[ 9], u1 );
+    svst1_u32( pg4, result[10], u2 );
+    svst1_u32( pg4, result[11], u3 );
+    svst1_u32( pg4, result[12], u4 );
+    svst1_u32( pg4, result[13], u5 );
+    svst1_u32( pg4, result[14], u6 );
+    svst1_u32( pg4, result[15], u7 );
+
+    for( ulong l=0UL; l<4UL; l++ ) {
+      uchar * out = hash + (i+l)*64UL;
+      for( ulong w=0UL; w<16UL; w++ ) FD_STORE( uint, out + 4UL*w, result[w][l] );
+    }
+  }
+}
+
+#undef ROUNDX
+#undef MX
 #undef ROUND
 #undef M
 #undef G

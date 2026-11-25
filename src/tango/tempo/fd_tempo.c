@@ -132,6 +132,7 @@ tick_per_ns_sample( ulong trial_cnt,
                     ulong trim_cnt,
                     long  sleep_ns ) {
 # define TRIAL_MAX (64UL)
+# define STAB_ITER (8UL)  /* max resample attempts before falling back */
   if( FD_UNLIKELY( trial_cnt>TRIAL_MAX ) )      FD_LOG_ERR(( "tick_per_ns_sample: trial_cnt %lu exceeds TRIAL_MAX %lu", trial_cnt, TRIAL_MAX ));
   if( FD_UNLIKELY( 2UL*trim_cnt>=trial_cnt ) )  FD_LOG_ERR(( "tick_per_ns_sample: trim_cnt %lu leaves no samples for trial_cnt %lu", trim_cnt, trial_cnt ));
   ulong iter = 0UL;
@@ -146,15 +147,23 @@ tick_per_ns_sample( ulong trial_cnt,
     double * sample     = trial + trim_cnt;
     ulong    sample_cnt = trial_cnt - 2UL*trim_cnt;
     ulong    thresh     = sample_cnt >> 1;
-    if( FD_LIKELY( fd_stat_robust_norm_fit_double( &mu, &sigma, sample, sample_cnt, sample )>thresh ) && FD_LIKELY( mu>0. ) )
-      break;
+    double   m, s;
+    if( FD_LIKELY( fd_stat_robust_norm_fit_double( &m, &s, sample, sample_cnt, sample )>thresh ) && FD_LIKELY( m>0. ) ) {
+      /* Stabilization gate: accept the rate only when its relative spread
+         is small.  A contended/preempted measurement window produces a
+         wide spread, and the resulting rate would corrupt downstream
+         async_min arithmetic, so reject it and resample. */
+      if( FD_LIKELY( s <= 0.01*m ) ) { mu = m; sigma = s; break; }
+      FD_LOG_WARNING(( "tick_per_ns estimate unstable (sigma/mean=%.3e); resampling (%lu/%lu)", s/m, iter+1UL, STAB_ITER ));
+    }
     iter++;
-    if( iter==3UL ) {
-      FD_LOG_WARNING(( "unable to measure tick_per_ns accurately; using fallback and attempting to continue" ));
+    if( iter==STAB_ITER ) {
+      FD_LOG_WARNING(( "unable to measure tick_per_ns stably after %lu attempts; using fallback and attempting to continue", STAB_ITER ));
       mu = 3.; sigma = 1e-7;
       break;
     }
   }
+#undef STAB_ITER
 #undef TRIAL_MAX
 }
 
@@ -192,15 +201,12 @@ fd_tempo_tick_per_ns_dev( double * opt_sigma ) {
 
     if( FD_LIKELY( !explicit_set ) ) {
 
-      /* Development-only fast path.  4 trials of ~0.25 ms (~1 ms total)
-         measures the rate to a few ppm and keeps sigma well defined
-         (>=2 trials), versus ~0.5 s for the production path.  This is
-         intended for firedancer-dev, where boot latency matters and the
-         rate is not used for anything consensus critical.  See
-         bench_tempo_calib for the accuracy/cost sweep that motivates
-         these constants. */
+      /* Development-only fast path.  32 trials of ~0.25 ms (~8 ms total)
+         gives a stable rate estimate (trimmed robust-normal fit over 24
+         samples) while still keeping boot latency low for firedancer-dev.
+         The rate is not used for anything consensus critical. */
 
-      tick_per_ns_sample( 4UL, 0UL, 262144L /* ~0.25 ms */ );
+      tick_per_ns_sample( 32UL, 4UL, 262144L /* ~0.25 ms */ );
 
       /* Mark the value explicit so a subsequent fd_tempo_tick_per_ns()
          (e.g. later in fd_config_fill) returns this measurement instead
@@ -327,8 +333,17 @@ fd_tempo_async_min( long  lazy,
   float _async_target = (tick_per_ns*_lazy) / _event_cnt; /* non-negative finite result, O(1) ulp error typically */
 
   if( FD_UNLIKELY( !(1.f<=_async_target) ) ) {
-    FD_LOG_WARNING(( "lazy, event_cnt and tick_per_ns imply an unreasonably small async_min" ));
-    return 0UL;
+    /* Sub-GHz tick counters (e.g. ARM CNTVCT at 24-100 MHz, where
+       tick_per_ns < 1) legitimately yield a sub-tick async_target for
+       low-latency tiles.  Clamp to the minimum meaningful interval of one
+       tick instead of failing: the housekeeping schedule simply runs at
+       the counter resolution. */
+    if( FD_UNLIKELY( !(0.f<_async_target) ) ) {
+      FD_LOG_WARNING(( "lazy, event_cnt and tick_per_ns imply a non-positive async_min" ));
+      return 0UL;
+    }
+    FD_LOG_WARNING(( "lazy, event_cnt and tick_per_ns imply a sub-tick async_min (%.3e); clamping to 1 tick", (double)_async_target ));
+    return 1UL;
   }
 
   if( FD_UNLIKELY( !(_async_target<((float)(1UL<<32))) ) ) {
